@@ -1,11 +1,18 @@
 package ee.carlrobert.codegpt.toolwindow.chat;
 
 import static ee.carlrobert.codegpt.completions.CompletionRequestProvider.getPromptWithContext;
+import static ee.carlrobert.codegpt.settings.service.ServiceType.ANTHROPIC;
+import static ee.carlrobert.codegpt.settings.service.ServiceType.CODEGPT;
+import static ee.carlrobert.codegpt.settings.service.ServiceType.OLLAMA;
+import static ee.carlrobert.codegpt.settings.service.ServiceType.OPENAI;
 import static ee.carlrobert.codegpt.ui.UIUtil.createScrollPaneWithSmartScroller;
+import static ee.carlrobert.llm.client.openai.completion.OpenAIChatCompletionModel.GPT_4_O;
+import static ee.carlrobert.llm.client.openai.completion.OpenAIChatCompletionModel.GPT_4_VISION_PREVIEW;
 import static java.lang.String.format;
 
 import com.intellij.openapi.Disposable;
 import com.intellij.openapi.actionSystem.ActionPlaces;
+import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.project.Project;
 import com.intellij.ui.JBColor;
@@ -24,6 +31,8 @@ import ee.carlrobert.codegpt.conversations.ConversationService;
 import ee.carlrobert.codegpt.conversations.message.Message;
 import ee.carlrobert.codegpt.settings.GeneralSettings;
 import ee.carlrobert.codegpt.settings.service.ServiceType;
+import ee.carlrobert.codegpt.settings.service.codegpt.CodeGPTServiceSettings;
+import ee.carlrobert.codegpt.settings.service.openai.OpenAISettings;
 import ee.carlrobert.codegpt.telemetry.TelemetryAction;
 import ee.carlrobert.codegpt.toolwindow.chat.ui.ChatMessageResponseBody;
 import ee.carlrobert.codegpt.toolwindow.chat.ui.ChatToolWindowScrollablePanel;
@@ -32,9 +41,9 @@ import ee.carlrobert.codegpt.toolwindow.chat.ui.UserMessagePanel;
 import ee.carlrobert.codegpt.toolwindow.chat.ui.textarea.ModelComboBoxAction;
 import ee.carlrobert.codegpt.toolwindow.chat.ui.textarea.TotalTokensDetails;
 import ee.carlrobert.codegpt.toolwindow.chat.ui.textarea.TotalTokensPanel;
-import ee.carlrobert.codegpt.toolwindow.chat.ui.textarea.UserPromptTextArea;
 import ee.carlrobert.codegpt.toolwindow.ui.ChatToolWindowLandingPanel;
 import ee.carlrobert.codegpt.ui.OverlayUtil;
+import ee.carlrobert.codegpt.ui.textarea.SmartTextPane;
 import ee.carlrobert.codegpt.util.EditorUtil;
 import ee.carlrobert.codegpt.util.file.FileUtil;
 import java.awt.BorderLayout;
@@ -43,6 +52,7 @@ import java.awt.GridBagLayout;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.UUID;
 import java.util.function.Consumer;
 import javax.swing.JComponent;
@@ -59,10 +69,12 @@ public class ChatToolWindowTabPanel implements Disposable {
   private final Project project;
   private final JPanel rootPanel;
   private final Conversation conversation;
-  private final UserPromptTextArea userPromptTextArea;
   private final ConversationService conversationService;
   private final TotalTokensPanel totalTokensPanel;
   private final ChatToolWindowScrollablePanel toolWindowScrollablePanel;
+  private final SmartTextPane textArea;
+
+  private @Nullable CompletionRequestHandler requestHandler;
 
   public ChatToolWindowTabPanel(@NotNull Project project, @NotNull Conversation conversation) {
     this.project = project;
@@ -74,10 +86,14 @@ public class ChatToolWindowTabPanel implements Disposable {
         conversation,
         EditorUtil.getSelectedEditorSelectedText(project),
         this);
-    userPromptTextArea = new UserPromptTextArea(this::handleSubmit, totalTokensPanel);
+    textArea = new SmartTextPane(project, this::handleSubmit, () -> {
+      if (requestHandler != null) {
+        requestHandler.cancel();
+      }
+      return null;
+    });
+    textArea.requestFocus();
     rootPanel = createRootPanel();
-    userPromptTextArea.requestFocusInWindow();
-    userPromptTextArea.requestFocus();
 
     if (conversation.getMessages().isEmpty()) {
       displayLandingView();
@@ -86,8 +102,27 @@ public class ChatToolWindowTabPanel implements Disposable {
     }
   }
 
+  private boolean isImageActionSupported() {
+    var selectedService = GeneralSettings.getSelectedService();
+    if (selectedService == ANTHROPIC || selectedService == OLLAMA) {
+      return true;
+    }
+    if (selectedService == CODEGPT) {
+      var model = ApplicationManager.getApplication().getService(CodeGPTServiceSettings.class)
+          .getState()
+          .getChatCompletionSettings()
+          .getModel();
+      return List.of("gpt-4o", "claude-3-opus").contains(model);
+    }
+
+    var model = OpenAISettings.getCurrentState().getModel();
+    return selectedService == OPENAI && (
+        GPT_4_VISION_PREVIEW.getCode().equals(model) || GPT_4_O.getCode().equals(model));
+  }
+
   public void dispose() {
     LOG.info("Disposing BaseChatToolWindowTabPanel component");
+    textArea.dispose();
   }
 
   public JComponent getContent() {
@@ -103,7 +138,7 @@ public class ChatToolWindowTabPanel implements Disposable {
   }
 
   public void requestFocusForTextArea() {
-    userPromptTextArea.focus();
+    textArea.requestFocus();
   }
 
   public void displayLandingView() {
@@ -233,24 +268,23 @@ public class ChatToolWindowTabPanel implements Disposable {
       return;
     }
 
-    var requestHandler = new CompletionRequestHandler(
+    requestHandler = new CompletionRequestHandler(
         new ToolWindowCompletionResponseEventListener(
             conversationService,
             responsePanel,
             totalTokensPanel,
-            userPromptTextArea) {
+            textArea) {
           @Override
           public void handleTokensExceededPolicyAccepted() {
             call(callParameters, responsePanel);
           }
         });
-    userPromptTextArea.setRequestHandler(requestHandler);
-    userPromptTextArea.setSubmitEnabled(false);
+    textArea.setSubmitEnabled(false);
 
     requestHandler.call(callParameters);
   }
 
-  private void handleSubmit(String text) {
+  private Unit handleSubmit(String text) {
     var message = new Message(text);
     var editor = EditorUtil.getSelectedEditor(project);
     if (editor != null) {
@@ -264,6 +298,7 @@ public class ChatToolWindowTabPanel implements Disposable {
     }
     message.setUserMessage(text);
     sendMessage(message, ConversationType.DEFAULT);
+    return null;
   }
 
   private JPanel createUserPromptPanel(ServiceType selectedService) {
@@ -279,7 +314,7 @@ public class ChatToolWindowTabPanel implements Disposable {
           ConversationService.getInstance().startConversation();
           contentManager.createNewTabPanel();
         })), BorderLayout.NORTH);
-    panel.add(JBUI.Panels.simplePanel(userPromptTextArea), BorderLayout.CENTER);
+    panel.add(JBUI.Panels.simplePanel(textArea), BorderLayout.CENTER);
     return panel;
   }
 
